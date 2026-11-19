@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""touchvault v2: API keys on macOS, sealed to this Mac's Secure Enclave. Opening a value needs the enrolled
+fingerprint, enforced by the chip, not by this script. The Keychain (service $TOUCHVAULT_SERVICE, default
+"touchvault") holds only "tv1:" ciphertext envelopes. No command here ever prints a value.
+
+  init [--force]                       create the Secure Enclave key (once per Mac; --force makes sealed values unreadable),
+                                       print its pubhash and pin it (Keychain service "touchvault-pin", no secret)
+  status                               key present + pubhash (compare with what init printed); sealed vs legacy items
+  migrate                              seal every legacy plain-text item in this service (no Touch ID, prints names only)
+  set NAME [--clipboard]               hidden on-screen dialog (or clipboard, then cleared) -> sealed -> Keychain
+  import NAME --from FILE [--var V]    copy one value out of a .env / shell profile (VAR=...) or JSON (--var a.b.c)
+  import NAME --from FILE --raw        whole file is the value (one-key files)
+  verify NAME --from FILE [--var V]    does the Keychain copy match the source? prints match / DIFFERENT
+  scan [DIR ...]                       where keys sit in plain text today (file + name only)
+  list                                 names stored
+  has NAME | delete NAME               no Touch ID needed (no value is read)
+  --repin (with set/import/migrate)    accept a changed key: only after YOU ran init --force; check status first
+Sealing refuses when the key's pubhash differs from the pin. Every value read (run/copy/verify, or get() from Python)
+asks for Touch ID; one touch covers all the names in that call. No password fallback. Legacy plain-text items are
+refused until you run migrate.
+  run NAME[,NAME...] -- CMD ...        run CMD with those keys as environment variables (never echoed)
+  copy NAME [--seconds 30]             put the key on the clipboard for a person to paste: this Mac only
+                                       (no Universal Clipboard), hidden from clipboard managers, wiped after N seconds
+
+Moving keys to your other Mac (values never leave a sealed envelope):
+  pubkey [--out FILE]                  this Mac's public key + pubhash (safe to share); --out writes it to FILE
+  send NAME[,NAME...]|--all --to PUBKEYFILE --expect PUBHASH -o BUNDLE
+                                       one Touch ID, then re-seals the values to the other Mac's key. --expect is
+                                       required: read the pubhash off the RECEIVING Mac's own screen (its
+                                       `touchvault pubkey`), never from the file or a message that came with it.
+                                       Prints a "bundle hash" for the receiving side
+  receive BUNDLE --expect BUNDLEHASH [--overwrite] [--only NAME,...] [--verify]
+                                       store a bundle made for this Mac (no Touch ID). --expect is required: the
+                                       bundle hash send printed, read off the SENDING Mac's own screen, never from
+                                       where the file came from. Existing names are skipped unless --overwrite;
+                                       --verify opens the received keys once (one touch)
+
+Python:  load this file as a module, then  tv.get("NAME")
+"""
+import base64, hashlib, json, os, re, subprocess, sys
+
+NAME_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_:.-]{0,80}$")
+SERVICE = os.environ.get("TOUCHVAULT_SERVICE", "touchvault")
+if not NAME_OK.match(SERVICE): sys.exit(f"bad TOUCHVAULT_SERVICE: {SERVICE!r}")
+SECRETY = re.compile(r"(KEY|TOKEN|SECRET|PASS|PASSWORD|PWD|PW|CREDENTIAL|AUTH|PRIVATE)", re.I)
+
+def _helper(name):
+    # installed layout: <prefix>/bin/touchvault + <prefix>/libexec/touchvault/<helper>; else the source tree's helpers/
+    here = os.path.dirname(os.path.realpath(__file__))
+    for p in (os.path.join(here, "..", "libexec", "touchvault", name), os.path.join(here, "helpers", name)):
+        if os.access(p, os.X_OK): return os.path.normpath(p)
+    sys.exit(f"helper '{name}' not found; run install.sh first")
+
+def _sec(*args):
+    return subprocess.run(["security", *args], capture_output=True, text=True)
+
+ENV = "tv1:"
+MAX = 1400   # plain chars; the sealed envelope is ~4/3 x (93 + n) and goes through `security -i` as hex
+ENV_MAX = len(ENV) + 4 * ((93 + MAX + 2) // 3)   # longest envelope a MAX-char value makes
+
+def _stored(name):
+    """The raw Keychain item: a tv1 envelope (ciphertext, safe to read with no prompt) or a legacy plain-text value.
+    The Claude hook only sees Claude's own command line, not this internal call."""
+    r = _sec("find-generic-password", "-s", SERVICE, "-a", name, "-w")
+    if r.returncode: raise KeyError(f"key '{name}' not in Keychain; store it with: touchvault set {name}")
+    return r.stdout.rstrip("\n")
+
+def _all(): return {n: _stored(n) for n in names()}
+
+def _open(envelopes, why):
+    """ONE Touch ID (Secure Enclave) for the whole (non-empty) list. Returns plaintexts in order."""
+    r = subprocess.run([_helper("sevault"), "open", why], input="".join(e + "\n" for e in envelopes),
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise PermissionError(f"LOCKED: {r.stderr.strip().removeprefix('sevault: ') or 'not approved'}; no key released")
+    out = r.stdout.split("\n")[:len(envelopes)]
+    if len(out) != len(envelopes): raise PermissionError("LOCKED: helper returned the wrong number of values")
+    return out
+
+# Opens ONLY the requested names, one Touch ID for the batch; plaintexts stay in this process's memory until it exits.
+_cache = {}
+
+def _load(want, why):
+    need = [n for n in dict.fromkeys(want) if n not in _cache]
+    if not need: return
+    raw = {n: _stored(n) for n in need}   # a missing name raises KeyError here, before any prompt
+    legacy = [n for n in need if not raw[n].startswith(ENV)]
+    if legacy: raise KeyError(f"legacy plain text in the Keychain: {', '.join(legacy)}; run: touchvault migrate")
+    _cache.update(zip(need, _open([raw[n] for n in need], why)))
+
+def get(name, why=None):
+    if not NAME_OK.match(name): raise KeyError(f"bad key name: {name!r}")
+    _load([name], why or f"release {name}" + (f" for {os.path.basename(sys.argv[0])}" if sys.argv and sys.argv[0] else ""))
+    return _cache[name]
+
+# ---- key pin: the pubhash init printed, kept in the Keychain (not a secret) so a swapped key file is noticed --------
+PIN_SERVICE, REPIN = "touchvault-pin", False
+def _pin_account():
+    d = os.environ.get("TOUCHVAULT_KEYDIR")
+    return os.path.realpath(d) if d else "default"
+
+def _pubhash():
+    r = subprocess.run([_helper("sevault"), "pubhash"], capture_output=True, text=True)
+    return (r.stdout.strip() if r.returncode == 0 else None), r.stderr.strip().removeprefix("sevault: ")
+
+def _pin():
+    r = _sec("find-generic-password", "-s", PIN_SERVICE, "-a", _pin_account(), "-w")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def _set_pin(h):
+    if _sec("add-generic-password", "-U", "-s", PIN_SERVICE, "-a", _pin_account(), "-w", h).returncode:
+        sys.exit("could not store the key pin in the Keychain")
+
+def _check_pin():
+    h, why = _pubhash()
+    if not h: sys.exit(f"{why} (nothing stored)")
+    pin = _pin()
+    if pin == h: return
+    if REPIN:
+        _set_pin(h); sys.stderr.write(f"re-pinned: pubhash {h}\n"); return
+    sys.exit(f"refusing to seal: this key's pubhash {h} is not the pinned one ({pin or 'none pinned'}). "
+             "If you ran `touchvault init --force` yourself (or made the key before pinning existed), check "
+             "`touchvault status` and rerun with --repin. If not, someone replaced your key files. (nothing stored)")
+
+def seal(value):
+    _check_pin()
+    r = subprocess.run([_helper("sevault"), "seal"], input=value, capture_output=True, text=True)
+    if r.returncode or not r.stdout.startswith(ENV): sys.exit(f"{r.stderr.strip() or 'seal failed'} (nothing stored)")
+    return r.stdout.strip()
+
+def _write(name, stored):
+    # goes in over stdin as hex (security -i), never on argv; stderr is never shown since it can echo the hex
+    r = subprocess.run(["security", "-i"], capture_output=True, text=True,
+                       input=f"add-generic-password -U -s {SERVICE} -a {name} -X {stored.encode().hex()}\n")
+    if r.returncode or r.stderr.strip(): sys.exit(f"Keychain refused '{name}' (rc {r.returncode})")
+
+def put(name, value):
+    if not NAME_OK.match(name): sys.exit(f"bad key name: {name!r}")
+    if not value: sys.exit("empty value, nothing stored")
+    if not (value.isascii() and value.isprintable()) or len(value) > MAX:
+        sys.exit(f"value must be printable ASCII, max {MAX} chars (nothing stored)")
+    _write(name, seal(value))
+    print(f"stored '{name}' ({len(value)} chars, sealed)")
+
+def migrate():
+    raw = _all()
+    legacy = [n for n in raw if not raw[n].startswith(ENV)]
+    if not legacy: print(f"nothing to migrate in '{SERVICE}'"); return
+    # no Touch ID: these values are already plain text to any same-user program, and nothing leaves this process
+    for n in legacy:
+        v = raw[n]
+        if not v or not (v.isascii() and v.isprintable()) or len(v) > MAX:
+            print(f"skipped '{n}': not printable ASCII up to {MAX} chars"); continue
+        _write(n, seal(v)); print(f"sealed '{n}'")
+    left = [n for n in names() if not _stored(n).startswith(ENV)]
+    print("all items sealed" if not left else "still plain text: " + ", ".join(left))
+    if left: sys.exit(1)
+
+def status():
+    h, why = _pubhash()
+    if not h: print(f"Secure Enclave key: MISSING or unusable ({why})")
+    else:
+        pin = _pin()
+        print(f"Secure Enclave key: present, pubhash {h}")
+        print("  pinned: yes" if pin == h else f"  pinned: NO, pin is {pin or 'missing'}; sealing will refuse (see --repin)")
+    raw = _all()
+    sealed = sorted(n for n in raw if raw[n].startswith(ENV))
+    legacy = sorted(n for n in raw if n not in sealed)
+    print(f"service '{SERVICE}': {len(sealed)} sealed, {len(legacy)} legacy plain text")
+    for n in legacy: print(f"  legacy  {n}")
+
+def _has(name):   # attributes only, no value, so no Touch ID needed
+    return _sec("find-generic-password", "-s", SERVICE, "-a", name).returncode == 0
+
+# ---- moving keys between Macs: values are re-sealed to the other Mac's key, plaintext never leaves this process ------
+def _sevault(*args, inp=""):
+    return subprocess.run([_helper("sevault"), *args], input=inp, capture_output=True, text=True)
+
+def pubkey(out=None):
+    pub = _sevault("pub").stdout.strip()
+    if not pub: sys.exit("no Secure Enclave key; run: touchvault init")
+    h = hashlib.sha256(base64.b64decode(pub)).hexdigest()
+    if _pin() != h: sys.stderr.write("warning: this key is not the pinned one; check `touchvault status` first\n")
+    print(f"pubhash {h}\npub {pub}")
+    if out:
+        with open(out, "w") as f: f.write(f"touchvault-pubkey v1\npubhash {h}\npub {pub}\n")
+        print(f"wrote {out} (public, safe to send any way you like)")
+
+def _read_pubfile(path):
+    """-> (pubhash, base64 pub) of a touchvault-pubkey v1 file that agrees with itself."""
+    try: l = open(os.path.expanduser(path)).read().split("\n")
+    except OSError as e: sys.exit(f"cannot read {path}: {e.strerror}")
+    try:
+        assert len(l) >= 3 and l[0] == "touchvault-pubkey v1" and l[1].startswith("pubhash ") and l[2].startswith("pub ")
+        pub = l[2][4:].strip(); raw = base64.b64decode(pub, validate=True)
+        assert len(raw) == 65 and raw[0] == 4
+    except (AssertionError, ValueError): sys.exit(f"{path} is not a touchvault-pubkey v1 file")
+    h = hashlib.sha256(raw).hexdigest()
+    if l[1][8:].strip().lower() != h: sys.exit(f"{path} is damaged: its pubhash line does not match its key")
+    return h, pub
+
+def send(want, pubfile, expect, out):
+    want = list(dict.fromkeys(want))
+    to, pub = _read_pubfile(pubfile)
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expect or ""):
+        sys.exit("--expect PUBHASH is required: read it off the receiving Mac's own screen (touchvault pubkey there)")
+    if expect.lower() != to:
+        sys.exit(f"refusing: {pubfile} holds key {to}, not the {expect} you expect. Do not send. (nothing opened)")
+    if _sevault("seal", "--pub-b64", pub, inp="x").returncode:   # a real curve point, checked before any prompt
+        sys.exit(f"{pubfile} does not hold a valid P-256 public key (nothing opened)")
+    if os.path.lexists(out): sys.exit(f"{out} already exists; pick another -o (nothing opened)")
+    d = os.path.dirname(os.path.abspath(out))
+    if not (os.path.isdir(d) and os.access(d, os.W_OK)): sys.exit(f"cannot write in {d}; pick another -o (nothing opened)")
+    me = _sevault("pubhash").stdout.strip() or sys.exit("no Secure Enclave key; run: touchvault init")
+    _load(want, f"send {len(want)} key(s) to the Mac with key {to[:12]}: {','.join(want)}"[:200])   # one Touch ID
+    lines = []
+    for n in want:   # sealed to the pub bytes checked above (not the file again, which could change meanwhile)
+        r = _sevault("seal", "--pub-b64", pub, inp=_cache[n])
+        if r.returncode or not r.stdout.startswith(ENV): sys.exit(f"{r.stderr.strip() or 'seal failed'} (no bundle written)")
+        lines.append(f"{n} {r.stdout.strip()}\n")
+    data = (f"touchvault-bundle v1\nfrom {me}\nto {to}\ncount {len(lines)}\n" + "".join(lines)).encode()
+    try:
+        with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f: f.write(data)
+    except OSError as e: sys.exit(f"cannot create {out}: {e.strerror} (no bundle written)")
+    h = hashlib.sha256(data).hexdigest()
+    print("\n".join(want) + f"\n{len(want)} key(s) sealed to {to} in {out}. Only that Mac's chip and fingerprint open them.")
+    print(f"\n  bundle hash {h}\n  On the other Mac run: touchvault receive {os.path.basename(out)} --expect {h}")
+
+def receive(path, expect, overwrite=False, only=None, verify=False):
+    def bad(why): sys.exit(f"refusing bundle: {why} (nothing stored)")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expect or ""):
+        sys.exit("--expect BUNDLEHASH is required: the bundle hash `send` printed, read off the SENDING Mac's own "
+                 "screen (nothing stored)")
+    try: data = open(os.path.expanduser(path), "rb").read()
+    except OSError as e: sys.exit(f"cannot read {path}: {e.strerror}")
+    if hashlib.sha256(data).hexdigest() != expect.lower():
+        bad("this file is not the one the sending Mac made (its hash differs from --expect); do not use it")
+    try: l = data.decode("ascii").split("\n")
+    except UnicodeDecodeError: bad("not a touchvault-bundle v1 file")
+    if l and l[-1] == "": l.pop()
+    if len(l) < 5 or l[0] != "touchvault-bundle v1": bad("not a touchvault-bundle v1 file")
+    hdr = {}
+    for i, k in enumerate(("from", "to", "count"), 1):
+        key, _, v = l[i].partition(" ")
+        if key != k or not v: bad(f"line {i + 1} should be '{k} ...'")
+        hdr[k] = v
+    if not all(re.fullmatch(r"[0-9a-f]{64}", hdr[k]) for k in ("from", "to")): bad("from/to is not a pubhash")
+    h = _sevault("pubhash").stdout.strip() or sys.exit("no Secure Enclave key; run: touchvault init")
+    if _pin() != h: sys.exit("refusing: this Mac's key is not the pinned one; check `touchvault status` (nothing stored)")
+    if hdr["to"] != h: bad(f"it was made for key {hdr['to']}, and this Mac's key is {h}")
+    items = {}
+    for i, ln in enumerate(l[4:], 5):   # line numbers only in errors: never echo an envelope
+        p = ln.split(" ")
+        if len(p) != 2 or not NAME_OK.match(p[0]) or not p[1].startswith(ENV) or len(p[1]) > ENV_MAX: bad(f"line {i} is malformed")
+        if p[0] in items: bad(f"{p[0]} appears twice")
+        items[p[0]] = p[1]
+    if hdr["count"] != str(len(items)): bad(f"count says {hdr['count']}, the bundle holds {len(items)}")
+    if only:
+        missing = [n for n in only if n not in items]
+        if missing: bad(f"not in this bundle: {', '.join(missing)}")
+        items = {n: items[n] for n in dict.fromkeys(only)}
+    if _sevault("check", inp="".join(e + "\n" for e in items.values())).returncode: bad("an envelope is not a valid tv1 envelope")
+    print(f"from {hdr['from']}  (compare with `touchvault status` on the sending Mac; if it is not yours, delete these)")
+    skipped = [n for n in items if not overwrite and _has(n)]
+    stored = [n for n in items if n not in skipped]
+    done = []
+    for n in stored:   # already sealed to this Mac's key: stored as-is
+        try: _write(n, items[n])
+        except SystemExit as e:
+            sys.exit(f"{e.code}. Stored before it stopped: {', '.join(done) or 'none'}. Rerun the same receive "
+                     "(without --overwrite) to finish: names already stored are skipped.")
+        done.append(n); print(f"stored  {n}")
+    for n in skipped: print(f"skipped {n} (already here; --overwrite replaces it)")
+    print(f"{len(stored)} stored, {len(skipped)} skipped")
+    if verify and stored:
+        _load(stored, f"check that {len(stored)} received key(s) open on this Mac")
+        print(f"verified: all {len(stored)} open on this Mac")
+
+def names():
+    out = []   # dump without -d lists attributes only, no secret data; parse one item (block) at a time
+    for block in _sec("dump-keychain").stdout.split("keychain: ")[1:]:
+        if re.search(rf'"svce"<blob>="{re.escape(SERVICE)}"', block):
+            m = re.search(r'"acct"<blob>="([^"]*)"', block)
+            if m: out.append(m.group(1))
+    return sorted(set(out))
+
+# ---- reading a value out of a source file (never printed) -------------------------------------------
+def _env_value(path, var):
+    val = None
+    for ln in open(os.path.expanduser(path), errors="ignore"):
+        m = re.match(rf"\s*(?:export\s+)?{re.escape(var)}\s*=\s*(.*)$", ln)
+        if m:   # last assignment wins, same as a shell
+            v = m.group(1).strip(); q = re.match(r'(["\'])(.*?)\1', v)
+            val = q.group(2) if q else re.split(r"\s#", v)[0].strip()
+    if val is None: sys.exit(f"{var} not found in {path}")
+    return val
+
+def _json_value(path, dotted):
+    v = json.load(open(os.path.expanduser(path)))
+    try:
+        for part in dotted.split("."):
+            v = v[int(part)] if isinstance(v, list) else v[part]
+    except (KeyError, IndexError, ValueError, TypeError): sys.exit(f"{dotted} not found in {path}")
+    if not isinstance(v, str): sys.exit(f"{dotted} in {path} is not a string")
+    return v
+
+def source_value(path, var, raw=False):
+    if raw: return open(os.path.expanduser(path)).read().strip()
+    return _json_value(path, var) if path.endswith(".json") else _env_value(path, var)
+
+# ---- scan: names + places only -------------------------------------------------------------------------
+SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "dist", "build", "Library"}
+def scan(roots):
+    hits = []
+    profiles = [os.path.expanduser(p) for p in ("~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile", "~/.profile")]
+    files = [p for p in profiles if os.path.isfile(p)]
+    for root in roots:
+        top = os.path.expanduser(root)
+        for d, dirs, fs in os.walk(top):
+            dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+            if d.count(os.sep) - top.count(os.sep) > 4: dirs[:] = []
+            for f in fs:
+                if (f.startswith(".env") and not re.search(r"example|sample|template", f)) or \
+                   re.fullmatch(r"(keys|secrets?|.*credentials?|.*token)\.json|.*\.(pem|key|p12)|\.netrc|\.npmrc|.+\.env", f, re.I):
+                    files.append(os.path.join(d, f))
+    for p in files:
+        try:
+            if p.endswith(".json"):
+                def walk(o, pre=""):
+                    if isinstance(o, dict):
+                        for k, v in o.items(): yield from walk(v, f"{pre}{k}.")
+                    elif isinstance(o, str) and SECRETY.search(pre) and o: yield pre[:-1]
+                hits += [(p, k) for k in walk(json.load(open(p)))]
+            else:
+                for ln in open(p, errors="ignore"):
+                    m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(\S.*)?$", ln)
+                    if m and m.group(2) and SECRETY.search(m.group(1)): hits.append((p, m.group(1)))
+        except Exception as e:
+            hits.append((p, f"(unreadable: {type(e).__name__})"))
+    stored = set(names())
+    for p, k in sorted(set(hits)):
+        print(f"{'IN KEYCHAIN ' if k.split('.')[-1] in stored or k in stored else 'plain text  '} {k:40s} {p.replace(os.path.expanduser('~'), '~')}")
+    if not hits: print("(no plain-text keys found)")
+
+def main(a):
+    global REPIN
+    if not a or a[0] in ("-h", "--help"): sys.exit(__doc__)
+    cmd, REPIN = a[0], "--repin" in a
+    if os.environ.get("TOUCHVAULT_KEYDIR") and cmd in ("init", "set", "import", "migrate", "pubkey", "send", "receive"):
+        sys.stderr.write(f"warning: TOUCHVAULT_KEYDIR is set, using the key in {os.environ['TOUCHVAULT_KEYDIR']} (meant for tests)\n")
+    def opt(flag, default=None):
+        if flag not in a: return default
+        i = a.index(flag) + 1
+        if i >= len(a): sys.exit(f"{flag} needs a value")
+        return a[i]
+    if cmd in ("set", "import", "verify", "has", "delete", "copy") and (len(a) < 2 or not NAME_OK.match(a[1])):
+        sys.exit("bad or missing key name")
+    if cmd == "set":
+        name = a[1]
+        if "--clipboard" in a:
+            # note: clipboard managers / Universal Clipboard may keep a copy; the dialog is safer when a person is there
+            val = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
+            subprocess.run(["pbcopy"], input="", text=True)
+        else:
+            script = (f'display dialog "Paste the value for {name}.\\nIt goes straight into the Keychain. Nothing else sees it." '
+                      f'default answer "" with hidden answer with title "touchvault" buttons {{"Cancel","Save"}} default button "Save"')
+            r = subprocess.run(["osascript", "-e", script, "-e", "text returned of result"], capture_output=True, text=True)
+            if r.returncode: sys.exit("cancelled")
+            val = r.stdout.strip()
+        put(name, val)
+    elif cmd in ("import", "verify"):
+        name, src = a[1], opt("--from")
+        if not src: sys.exit(f"usage: {cmd} NAME --from FILE [--var VAR]")
+        val = source_value(src, opt("--var", name), raw="--raw" in a)
+        if cmd == "import": put(name, val)
+        else: print(f"{name}: " + ("match" if get(name) == val else "DIFFERENT"))
+    elif cmd == "init":
+        rc = subprocess.run([_helper("sevault"), "init", *(["--force"] if "--force" in a else [])]).returncode
+        if rc: sys.exit(rc)
+        h, why = _pubhash()
+        if not h: sys.exit(why)
+        _set_pin(h)
+        print(f"pubhash {h} (pinned). Write it down: `touchvault status` shows it, and it should never change "
+              "unless you run init --force.")
+    elif cmd == "status": status()
+    elif cmd == "migrate": migrate()
+    elif cmd == "scan": scan(a[1:] or [".", "~/.config"])
+    elif cmd == "list": print("\n".join(names()) or "(none)")
+    elif cmd == "has":
+        ok = _has(a[1])
+        print("yes" if ok else "no"); sys.exit(0 if ok else 1)
+    elif cmd == "pubkey": pubkey(opt("--out"))
+    elif cmd == "send":
+        if len(a) < 2 or not opt("--to") or not opt("-o"):
+            sys.exit("usage: send NAME[,NAME...]|--all --to PUBKEYFILE --expect PUBHASH -o BUNDLE\n"
+                     "  --expect: the pubhash shown on the RECEIVING Mac's own screen (touchvault pubkey there)")
+        want = names() if a[1] == "--all" else a[1].split(",")
+        if not want or not all(NAME_OK.match(n) for n in want): sys.exit("bad key name, or nothing to send")
+        send(want, opt("--to"), opt("--expect"), opt("-o"))
+    elif cmd == "receive":
+        if len(a) < 2 or a[1].startswith("-"):
+            sys.exit("usage: receive BUNDLE --expect BUNDLEHASH [--overwrite] [--only NAME,...] [--verify]\n"
+                     "  --expect: the bundle hash shown on the SENDING Mac's own screen when it ran send")
+        only = opt("--only")
+        if only and not all(NAME_OK.match(n) for n in only.split(",")): sys.exit("bad key name in --only")
+        receive(a[1], opt("--expect"), "--overwrite" in a, only.split(",") if only else None, "--verify" in a)
+    elif cmd == "delete":
+        ok = _sec("delete-generic-password", "-s", SERVICE, "-a", a[1]).returncode == 0
+        print("deleted" if ok else "not found"); sys.exit(0 if ok else 1)
+    elif cmd == "copy":
+        secs = opt("--seconds", "30")
+        if not secs.isdigit() or not 1 <= int(secs) <= 300: sys.exit("--seconds must be 1-300")
+        helper = _helper("concealed_copy")
+        val = get(a[1])   # Touch ID happens here
+        h = subprocess.Popen([helper, secs], stdin=subprocess.PIPE, text=True, start_new_session=True)
+        h.stdin.write(val); h.stdin.close()   # helper keeps running on its own and wipes later; we return now
+        print(f"'{a[1]}' is on the clipboard for {secs} s (this Mac only), then wiped")
+    elif cmd == "run":
+        if "--" not in a or len(a) < 4 or a.index("--") != 2: sys.exit("usage: run NAME[,NAME] -- CMD ...")
+        keys, argv = a[1].split(","), a[3:]
+        if not all(NAME_OK.match(n) for n in keys): sys.exit("bad key name")
+        _load(keys, f"give {','.join(keys)} to: {' '.join(argv)[:120]}")   # the person sees what they approve
+        env = {**os.environ, **{n: _cache[n] for n in keys}}
+        try: sys.exit(subprocess.run(argv, env=env).returncode)
+        except FileNotFoundError: sys.exit(f"command not found: {argv[0]}")
+    else: sys.exit(__doc__)
+
+if __name__ == "__main__":
+    try: main(sys.argv[1:])
+    except PermissionError as e: sys.exit(str(e))
+    except KeyError as e: sys.exit(e.args[0])
